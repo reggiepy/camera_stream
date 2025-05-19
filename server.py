@@ -11,154 +11,13 @@ import base64
 import threading
 import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-
 
 logger = logging.getLogger()
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WebSocket Camera Stream</title>
-    <style>
-        body {
-            font-family: sans-serif;
-        }
-        .disconnected-text {
-            color: #333;
-            font-size: 28px;
-            font-weight: bold;
-            text-align: center;
-        }
-    </style>
-    <script src="/static/js/snappyjs.min.js"></script>
-</head>
-<body>
-    <center><h2>WebSocket 摄像头视频流</h2></center>
-    <center>
-        <label>摄像头 ID: 
-            <select id="camera_id">
-                <option value="0">摄像头 0</option>
-                <option value="1">摄像头 1</option>
-            </select>
-        </label>
-        <label>宽: <input id="width" type="number" value="640" min="1" /></label>
-        <label>高: <input id="height" type="number" value="480" min="1" /></label>
-        <label>FPS: <input id="fps" type="number" value="30" min="1" max="60" /></label>
-        <button onclick="toggleCamera()">打开摄像头</button>
-    </center>
-    <center><canvas id="canvas" width="640" height="480"></canvas></center>
-
-    <script>
-        let ws = null;
-        let streaming = false;
-        let isConnected = false;
-
-        const canvas = document.getElementById("canvas");
-        const ctx = canvas.getContext("2d");
-        const img = new Image();
-
-        function toggleCamera() {
-            const btn = document.querySelector("button");
-
-            if (streaming) {
-                ws?.close();
-                streaming = false;
-                isConnected = false;
-                btn.textContent = "打开摄像头";
-                drawDisconnectedScreen();
-                return;
-            }
-
-            const cameraId = document.getElementById("camera_id").value;
-            const width = document.getElementById("width").value;
-            const height = document.getElementById("height").value;
-            const fps = document.getElementById("fps").value;
-
-            canvas.width = width;
-            canvas.height = height;
-
-            ws = new WebSocket(`ws://${location.host}/ws/camera?camera_id=${cameraId}&width=${width}&height=${height}&fps=${fps}`);
-
-            ws.onopen = () => {
-                isConnected = true;
-                streaming = true;
-                btn.textContent = "关闭摄像头";
-            };
-
-            ws.onmessage = async (event) => {
-                if (!isConnected) return;
-            
-                // 判断是否是文本消息（错误信息）
-                if (typeof event.data === "string") {
-                    if (event.data.startsWith("ERROR:")) {
-                        alert(event.data);
-                        ws.close();
-                    } else {
-                        console.warn("收到未知文本消息", event.data);
-                    }
-                    return;
-                }
-                
-                // 二进制数据处理
-                const compressed = new Uint8Array(await event.data.arrayBuffer());
-                let decompressed;
-                try {
-                    decompressed = window.SnappyJS.uncompress(compressed);
-                } catch (err) {
-                    console.error("Snappy 解压失败", err);
-                    return;
-                }
-
-                // 转成 Blob，再转 URL 用于图像加载
-                const blob = new Blob([decompressed], { type: "image/jpeg" });
-                const url = URL.createObjectURL(blob);
-                img.src = url;
-
-                img.onload = () => {
-                    if (!isConnected) return;
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                };
-
-                //img.src = 'data:image/jpeg;base64,' + event.data;
-            };
-
-            ws.onclose = () => {
-                isConnected = false;
-                streaming = false;
-                btn.textContent = "打开摄像头";
-                drawDisconnectedScreen();
-            };
-
-            ws.onerror = () => {
-                isConnected = false;
-                streaming = false;
-                btn.textContent = "打开摄像头";
-                alert("WebSocket 出错");
-                drawDisconnectedScreen();
-            };
-        }
-
-        function drawDisconnectedScreen() {
-            ctx.fillStyle = "#ccc";
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            ctx.fillStyle = "#333";
-            ctx.font = "28px sans-serif";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText("连接已断开", canvas.width / 2, canvas.height / 2);
-        }
-    </script>
-</body>
-</html>
-"""
 
 
 class CameraStreamer:
@@ -199,7 +58,7 @@ class CameraStreamer:
             if self.frame is None:
                 return None
             ret, jpeg = cv2.imencode(".jpg", self.frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-            #ret, jpeg = cv2.imencode(".jpg", self.frame)
+            # ret, jpeg = cv2.imencode(".jpg", self.frame)
             if not ret:
                 logger.error("JPEG 编码失败")
                 return None
@@ -214,11 +73,12 @@ class CameraStreamer:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTML_PAGE
+    return RedirectResponse("/static/index.html")
 
 
 @app.websocket("/ws/camera")
-async def websocket_camera(websocket: WebSocket, camera_id: int = 0, width: int = 640, height: int = 480, fps: int = 30):
+async def websocket_camera(websocket: WebSocket, camera_id: int = 0, width: int = 640, height: int = 480,
+                           fps: int = 30):
     await websocket.accept()
     try:
         streamer = CameraStreamer(camera_id, width, height, fps)
@@ -255,4 +115,5 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler()],
     )
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8011)

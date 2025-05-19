@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebSocket Camera Stream</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      background: #f9f9f9;
+      color: #333;
+    }
+    .center {
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .controls label {
+      margin-right: 10px;
+    }
+    button {
+      cursor: pointer;
+      padding: 6px 14px;
+      font-size: 14px;
+    }
+    canvas {
+      background: #000;
+      border: 1px solid #ccc;
+      display: block;
+      margin: 0 auto 20px auto;
+    }
+  </style>
+  <script src="/static/js/snappyjs.min.js"></script>
+</head>
+<body>
+
+  <h2 class="center">WebSocket 摄像头视频流</h2>
+
+  <div class="controls center">
+    <label>摄像头 ID:
+      <select id="camera_id">
+        <option value="0">摄像头 0</option>
+        <option value="1">摄像头 1</option>
+      </select>
+    </label>
+    <label>宽: <input id="width" type="number" value="640" min="1" /></label>
+    <label>高: <input id="height" type="number" value="480" min="1" /></label>
+    <label>FPS: <input id="fps" type="number" value="30" min="1" max="60" /></label>
+    <button id="toggle_btn">打开摄像头</button>
+  </div>
+
+  <canvas id="canvas" width="640" height="480"></canvas>
+
+  <script>
+    class CameraStream {
+      constructor({
+        wsUrlBase = `ws://${location.host}/ws/camera`,
+        canvasId = 'canvas',
+        toggleBtnId = 'toggle_btn',
+        cameraIdId = 'camera_id',
+        widthId = 'width',
+        heightId = 'height',
+        fpsId = 'fps'
+      } = {}) {
+        this.wsUrlBase = wsUrlBase;
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.img = new Image();
+
+        this.toggleBtn = document.getElementById(toggleBtnId);
+        this.cameraIdEl = document.getElementById(cameraIdId);
+        this.widthEl = document.getElementById(widthId);
+        this.heightEl = document.getElementById(heightId);
+        this.fpsEl = document.getElementById(fpsId);
+
+        this.ws = null;
+        this.streaming = false;
+        this.isConnected = false;
+
+        this._bindEvents();
+        this.drawDisconnectedScreen('摄像头未打开');
+      }
+
+      _bindEvents() {
+        this.toggleBtn.addEventListener('click', () => this.toggleCamera());
+        this.img.onload = () => {
+          if (!this.isConnected) return;
+          this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+          this.ctx.drawImage(this.img, 0, 0, this.canvas.width, this.canvas.height);
+        };
+      }
+
+      toggleCamera() {
+        if (this.streaming) {
+          this._closeWebSocket();
+          return;
+        }
+
+        const cameraId = this.cameraIdEl.value;
+        const width = parseInt(this.widthEl.value, 10);
+        const height = parseInt(this.heightEl.value, 10);
+        const fps = parseInt(this.fpsEl.value, 10);
+
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.drawDisconnectedScreen('正在打开摄像头');
+
+        const wsUrl = `${this.wsUrlBase}?camera_id=${cameraId}&width=${width}&height=${height}&fps=${fps}`;
+        this.ws = new WebSocket(wsUrl);
+
+        this.ws.binaryType = 'blob'; // 明确二进制数据类型为 Blob
+
+        this.ws.onopen = () => {
+          this.isConnected = true;
+          this.streaming = true;
+          this.toggleBtn.textContent = '关闭摄像头';
+        };
+
+        this.ws.onmessage = async (event) => {
+          if (!this.isConnected) return;
+
+          if (typeof event.data === 'string') {
+            if (event.data.startsWith('ERROR:')) {
+              alert(event.data);
+              this._closeWebSocket();
+            } else {
+              console.warn('收到未知文本消息:', event.data);
+            }
+            return;
+          }
+
+          try {
+            const arrayBuffer = await event.data.arrayBuffer();
+            const compressed = new Uint8Array(arrayBuffer);
+            const decompressed = window.SnappyJS.uncompress(compressed);
+            const blob = new Blob([decompressed], { type: 'image/jpeg' });
+            this.img.src = URL.createObjectURL(blob);
+          } catch (err) {
+            console.error('Snappy 解压失败', err);
+          }
+        };
+
+        this.ws.onclose = () => {
+          this.isConnected = false;
+          this.streaming = false;
+          this.toggleBtn.textContent = '打开摄像头';
+          this.drawDisconnectedScreen('连接已断开');
+        };
+
+        this.ws.onerror = () => {
+          this.isConnected = false;
+          this.streaming = false;
+          this.toggleBtn.textContent = '打开摄像头';
+          alert('WebSocket 出错');
+          this.drawDisconnectedScreen('连接已断开');
+        };
+      }
+
+      _closeWebSocket() {
+        if (this.ws) {
+          this.ws.close();
+          this.ws = null;
+        }
+        this.streaming = false;
+        this.isConnected = false;
+        this.toggleBtn.textContent = '打开摄像头';
+        this.drawDisconnectedScreen('摄像头未打开');
+      }
+
+      drawDisconnectedScreen(message) {
+        this.ctx.fillStyle = '#ccc';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+        this.ctx.fillStyle = '#333';
+        this.ctx.font = '28px sans-serif';
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        this.ctx.fillText(message, this.canvas.width / 2, this.canvas.height / 2);
+      }
+    }
+
+    // 页面加载完成后实例化
+    window.addEventListener('DOMContentLoaded', () => {
+      window.cameraStream = new CameraStream();
+    });
+  </script>
+
+</body>
+</html>

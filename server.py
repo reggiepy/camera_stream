@@ -1,74 +1,92 @@
 import os
 
-from websockets import ConnectionClosedOK
-
-# 参见 https://github.com/opencv/opencv/issues/17687
+# 禁用 OpenCV 硬件加速（某些设备会崩溃）
 os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
-import snappy
 import cv2
+import snappy
+import anyio
 import asyncio
-import base64
-import threading
 import logging
+import uvicorn
+
+from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from websockets.exceptions import ConnectionClosedOK
 
-logger = logging.getLogger()
+# 初始化日志
+logger = logging.getLogger(__name__)
 
+# FastAPI 应用及静态资源挂载
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+# 摄像头管理类
 class CameraStreamer:
     def __init__(self, camera_id: int, width=640, height=480, fps=30):
         self.camera_id = camera_id
-        self.cap = cv2.VideoCapture(camera_id)
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.frame: Optional[bytes] = None
+        self.lock = asyncio.Lock()
+        self.subscriber_count = 0
 
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.running = False
+        self._thread_stream: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self.running:
+            return
+
+        self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
-            raise RuntimeError(f"无法打开摄像头 {camera_id}")
+            raise RuntimeError(f"无法打开摄像头 {self.camera_id}")
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
-        actual_width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        logger.info(f"Camera {camera_id} opened with resolution {actual_width}x{actual_height} at {actual_fps} FPS")
+        logger.info(f"Camera {self.camera_id} opened: {self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x"
+                    f"{self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)} @ {self.cap.get(cv2.CAP_PROP_FPS)} FPS")
 
-        self.lock = threading.Lock()
-        self.frame = None
         self.running = True
-        self.thread = threading.Thread(target=self._update_frame, daemon=True)
-        self.thread.start()
+        self._thread_stream = asyncio.create_task(self._update_frame())
 
-    def _update_frame(self):
+    async def _update_frame(self):
+        delay = 1.0 / self.fps
         while self.running:
-            ret, frame = self.cap.read()
+            ret, frame = await anyio.to_thread.run_sync(lambda: self.cap.read())
             if ret:
-                with self.lock:
+                async with self.lock:
                     self.frame = frame
             else:
                 logger.warning(f"读取摄像头 {self.camera_id} 帧失败")
-                asyncio.run(asyncio.sleep(0.05))
+            await asyncio.sleep(delay)
 
-    def get_frame(self):
-        with self.lock:
+    async def get_frame(self) -> Optional[bytes]:
+        async with self.lock:
             if self.frame is None:
                 return None
             ret, jpeg = cv2.imencode(".jpg", self.frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-            # ret, jpeg = cv2.imencode(".jpg", self.frame)
-            if not ret:
-                logger.error("JPEG 编码失败")
-                return None
-            return jpeg.tobytes()
+            return jpeg.tobytes() if ret else None
 
-    def release(self):
+    async def stop(self):
         self.running = False
-        self.thread.join(timeout=1)
-        self.cap.release()
+        if self._thread_stream:
+            await self._thread_stream
+        if self.cap:
+            self.cap.release()
+            self.cap = None
         logger.info(f"Camera {self.camera_id} released")
+
+
+# 全局摄像头实例缓存
+camera_streamers: Dict[int, CameraStreamer] = {}
+camera_streamers_lock = asyncio.Lock()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -80,32 +98,39 @@ async def index():
 async def websocket_camera(websocket: WebSocket, camera_id: int = 0, width: int = 640, height: int = 480,
                            fps: int = 30):
     await websocket.accept()
-    try:
-        streamer = CameraStreamer(camera_id, width, height, fps)
-    except RuntimeError as e:
-        await websocket.send_text(f"ERROR: {e}")
-        await websocket.close()
-        return
+
+    async with camera_streamers_lock:
+        streamer = camera_streamers.get(camera_id)
+        if not streamer:
+            streamer = CameraStreamer(camera_id, width, height, fps)
+            try:
+                await streamer.start()
+            except RuntimeError as e:
+                await websocket.send_text(f"ERROR: {e}")
+                await websocket.close()
+                return
+            camera_streamers[camera_id] = streamer
+        streamer.subscriber_count += 1
 
     try:
         delay = 1.0 / fps
         while True:
-            buffer = streamer.get_frame()
-            if buffer is not None:
-                # frame = base64.b64encode(buffer).decode("utf-8")
-                # await websocket.send_text(frame)
-                compressed = snappy.compress(buffer)  # 压缩 jpeg 二进制
-                await websocket.send_bytes(compressed)  # 发送二进制数据
+            frame = await streamer.get_frame()
+            if frame:
+                await websocket.send_bytes(snappy.compress(frame))
             await asyncio.sleep(delay)
 
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket 客户端主动断开 (camera_id={camera_id})")
-    except ConnectionClosedOK:
-        logger.info(f"WebSocket 正常关闭 (camera_id={camera_id})")
-    except Exception as e:
-        logger.exception("WebSocket 内部发生异常")
+    except (WebSocketDisconnect, ConnectionClosedOK):
+        logger.info(f"WebSocket 关闭 (camera_id={camera_id})")
+    except Exception:
+        logger.exception(f"WebSocket 错误 (camera_id={camera_id})")
+
     finally:
-        streamer.release()
+        async with camera_streamers_lock:
+            streamer.subscriber_count -= 1
+            if streamer.subscriber_count <= 0:
+                await streamer.stop()
+                camera_streamers.pop(camera_id, None)
 
 
 if __name__ == "__main__":
@@ -114,6 +139,4 @@ if __name__ == "__main__":
         format="[%(asctime)s] %(levelname)s: %(message)s",
         handlers=[logging.StreamHandler()],
     )
-    import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8011)
